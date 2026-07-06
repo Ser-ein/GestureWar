@@ -1,8 +1,8 @@
 import cv2
 import mediapipe as mp
-# 显式导入 solutions 模块，防止某些环境下的 AttributeError
-from mediapipe.python.solutions import hands as mp_hands
-from mediapipe.python.solutions import drawing_utils as mp_drawing
+# 使用最标准的 solutions 导入方式
+import mediapipe.solutions.hands as mp_hands
+import mediapipe.solutions.drawing_utils as mp_drawing
 import time
 
 def main():
