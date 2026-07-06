@@ -64,3 +64,37 @@
 - **手势识别**：首选 **MediaPipe** (实时性极佳) 或 **YOLOv5** (针对特定物体/姿态识别)。
 - **通信协议**：使用 **UDP** 进行高频位置同步，**TCP** 进行状态切换 (如开始游戏、重置)。
 - **平滑处理**：必须加入滤波算法，否则摄像头采集的坐标跳变会严重影响游戏体验。
+
+---
+
+## 🐍 Python 端架构与环境
+
+### 1. 依赖库安装
+在 PyCharm 的终端 (Terminal) 中运行：
+```bash
+pip install -r requirements.txt
+```
+
+### 2. 代码架构说明
+代码文件：[hand_tracking.py](file:///c:/Users/16533/Desktop/project/hand_tracking.py)
+
+架构遵循 **捕获 -> 处理 -> 识别 -> 渲染** 的流水线模式：
+
+*   **初始化层 (Initialization)**：
+    *   加载 `mediapipe.solutions.hands` 模型。
+    *   配置检测置信度 (`min_detection_confidence`)。
+    *   启动 `cv2.VideoCapture` 访问本地摄像头。
+*   **输入预处理层 (Preprocessing)**：
+    *   `cv2.flip`: 水平翻转图像（解决镜像问题，更符合操作直觉）。
+    *   `cv2.cvtColor`: BGR 转 RGB（MediaPipe 模型要求）。
+*   **推理引擎层 (Inference)**：
+    *   `hands.process()`: 调用深度学习模型进行手部 21 个关键点坐标提取。
+*   **坐标转换层 (Post-processing)**：
+    *   将归一化的坐标 (0-1) 映射到当前窗口的像素坐标 (W, H)。
+*   **渲染层 (Rendering)**：
+    *   `mp_drawing.draw_landmarks`: 绘制手部骨骼。
+    *   `cv2.putText`: 显示实时 FPS。
+    *   `cv2.imshow`: 输出最终合成的可视化窗口。
+*   **交互逻辑层 (Interaction)**：
+    *   检测 `q` 键退出程序。
+    *   (待开发) 将关键坐标点通过 UDP 协议封包发送给 Unity。
