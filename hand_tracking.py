@@ -1,12 +1,12 @@
 import cv2
 import mediapipe as mp
-# 使用最标准的 solutions 导入方式
-import mediapipe.solutions.hands as mp_hands
-import mediapipe.solutions.drawing_utils as mp_drawing
 import time
 
 def main():
     # 初始化 MediaPipe 手部模型
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+    
     # 设置检测参数
     # static_image_mode=False 表示处理视频流
     # max_num_hands=2 最多检测两只手
