@@ -84,7 +84,7 @@ class HandTracker:
     """手部追踪器类 - 适配 MediaPipe 0.10.35+ Tasks API"""
 
     def __init__(self, max_hands=2, detection_confidence=0.7, tracking_confidence=0.5,
-                 enable_gesture=True):
+                 enable_gesture=True, use_kalman=False):
         """
         初始化手部追踪器
 
@@ -93,6 +93,7 @@ class HandTracker:
             detection_confidence: 检测置信度阈值
             tracking_confidence: 追踪置信度阈值
             enable_gesture: 是否启用手势分类
+            use_kalman: 是否使用 Kalman 滤波 (默认 EMA)
         """
         print("正在初始化手部追踪器 (MediaPipe 0.10.35+ Tasks API)...")
 
@@ -136,7 +137,8 @@ class HandTracker:
 
         # 手势分类器
         self.enable_gesture = enable_gesture
-        self.gesture_classifier = GestureClassifier() if enable_gesture else None
+        self.use_kalman = use_kalman
+        self.gesture_classifier = GestureClassifier(use_kalman=use_kalman) if enable_gesture else None
 
         # 性能统计
         self.fps = 0
@@ -369,6 +371,18 @@ class HandTracker:
         cv2.putText(frame, state_text, (bar_x, line3_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, state_color, 1)
 
+        # ---- 平滑器类型 ----
+        line4_y = line3_y + 16
+        smoother_info = clf.get_smoother_info()
+        if smoother_info["type"] == "Kalman":
+            s_text = f"Smoother: KF (q={clf._kalman_q}, r={clf._kalman_r})"
+            s_color = (255, 200, 100)  # 金色 = Kalman
+        else:
+            s_text = f"Smoother: EMA (a_o={clf._ema_alphas[0]}, a_w={clf._ema_alphas[1]})"
+            s_color = (150, 200, 150)  # 淡绿 = EMA
+        cv2.putText(frame, s_text, (bar_x, line4_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, s_color, 1)
+
     def release(self):
         """释放资源"""
         print("释放手部追踪器资源...")
@@ -453,6 +467,7 @@ def main():
     print("  [s] 保存当前帧为图片")
     print("  [i] 显示详细信息")
     print("  [u] 切换 UDP 发送 (开/关)")
+    print("  [k] 切换 Kalman/EMA 平滑器")
     print("=" * 60)
 
     # 初始化手部追踪器
@@ -548,12 +563,22 @@ def main():
                         di = tracker.gesture_classifier.debug_info
                         if di:
                             print(f"分类器调试: {di}")
+                        si = tracker.gesture_classifier.get_smoother_info()
+                        print(f"平滑器: {si['type']} | 参数: {si}")
                     last_debug_time = current_time
             elif key == ord('u'):
                 # 切换 UDP 发送
                 udp_enabled = not udp_enabled
                 status = "启用" if udp_enabled else "禁用"
                 print(f"UDP 发送已{status}")
+            elif key == ord('k'):
+                # 切换 Kalman / EMA 平滑器
+                if tracker.gesture_classifier:
+                    new_mode = tracker.gesture_classifier.toggle_smoother()
+                    tracker.use_kalman = tracker.gesture_classifier.use_kalman
+                    print(f"平滑器已切换为: {new_mode.upper()}")
+                    info = tracker.gesture_classifier.get_smoother_info()
+                    print(f"  参数: {info}")
 
     except KeyboardInterrupt:
         print("\n程序被用户中断")

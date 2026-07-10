@@ -13,6 +13,7 @@ GestureWar - 手势分类模块
 
 import time
 import math
+import numpy as np
 from collections import deque
 
 # ---------------------------------------------------------------------------
@@ -104,6 +105,117 @@ class EMASmoother:
 
 
 # ---------------------------------------------------------------------------
+# Kalman 平滑器 — 2D 恒速模型，替代 EMA 的即插即用方案
+# ---------------------------------------------------------------------------
+
+class KalmanSmoother:
+    """
+    卡尔曼滤波器 (2D 恒速模型: 位置 + 速度)。
+
+    相比 EMA 的优势:
+      - 内置运动模型 — 根据上帧速度预测下帧位置，快速运动时不会"追不上"
+      - 自适应增益 — 测量可靠时紧跟数据，噪声大时自动加重平滑
+      - 同时输出速度估计 — 可用于更精准的运动检测
+
+    参数:
+        process_noise: 过程噪声强度 q (默认 0.01)
+            越大 → 越信任运动模型，响应更快但可能过冲
+            越小 → 越平滑，但快速运动时滞后增大
+        measurement_noise: 测量噪声方差 r (默认 0.005)
+            越大 → 越不信任原始数据，输出更平滑但延迟大
+            越小 → 输出更贴近原始数据，保留更多细节
+
+    接口与 EMASmoother 完全一致:
+        .update(value) → float   (返回滤波值)
+        .value → float | None    (当前滤波值)
+        .velocity → float        (当前速度估计, Kalman 独有)
+        .reset()
+    """
+
+    def __init__(self, process_noise=0.01, measurement_noise=0.005):
+        self.q = process_noise       # 过程噪声强度
+        self.r = measurement_noise   # 测量噪声方差
+        self.x = None    # 状态向量 [pos, vel]^T (2×1)
+        self.P = None    # 协方差矩阵 (2×2)
+        self._last_time = None
+
+    def update(self, new_value, dt=None):
+        """
+        输入新测量值，返回卡尔曼滤波后的估计值。
+
+        参数:
+            new_value: 新的原始测量值
+            dt: 距上次更新的时间间隔 (秒)，None 则自动计算 (30fps 假设)
+        """
+        now = time.time()
+
+        # ---- 首次测量 → 初始化状态 ----
+        if self.x is None:
+            self.x = np.array([[new_value], [0.0]], dtype=np.float64)
+            self.P = np.array([[self.r, 0.0], [0.0, 1.0]], dtype=np.float64)
+            self._last_time = now
+            return float(self.x[0, 0])
+
+        # ---- 时间间隔 ----
+        if dt is None:
+            dt = now - self._last_time
+        if dt <= 0.0:
+            dt = 0.033   # 假设 30fps
+        if dt > 0.5:     # 超过 0.5s 视为断连，重置速度先验
+            dt = 0.033
+
+        # ---- 预测步骤 (恒速模型) ----
+        # 状态转移:  pos_k   = pos_{k-1} + vel_{k-1} * dt
+        #            vel_k   = vel_{k-1}
+        F = np.array([[1.0, dt], [0.0, 1.0]], dtype=np.float64)
+
+        # 过程噪声协方差 Q (恒速模型的标准形式)
+        q = self.q
+        dt2 = dt * dt
+        dt3 = dt2 * dt
+        dt4 = dt3 * dt
+        Q = np.array([
+            [q * dt4 / 4.0, q * dt3 / 2.0],
+            [q * dt3 / 2.0, q * dt2],
+        ], dtype=np.float64)
+
+        x_pred = F @ self.x
+        P_pred = F @ self.P @ F.T + Q
+
+        # ---- 更新步骤 (只观测位置) ----
+        H = np.array([[1.0, 0.0]], dtype=np.float64)
+        y = new_value - float((H @ x_pred)[0, 0])      # 新息
+        S = float((H @ P_pred @ H.T)[0, 0]) + self.r   # 新息协方差
+        K = P_pred @ H.T / S                             # 卡尔曼增益 (2×1)
+
+        self.x = x_pred + K * y
+        self.P = P_pred - K @ (H @ P_pred)
+
+        self._last_time = now
+        return float(self.x[0, 0])
+
+    @property
+    def value(self):
+        """当前的滤波位置"""
+        if self.x is not None:
+            return float(self.x[0, 0])
+        return None
+
+    @property
+    def velocity(self):
+        """当前估计的速度 (归一化坐标/秒)"""
+        if self.x is not None:
+            return float(self.x[1, 0])
+        return 0.0
+
+    def reset(self):
+        """重置滤波器状态"""
+        self.x = None
+        self.P = None
+        self._last_time = None
+
+
+# ---------------------------------------------------------------------------
 # GestureClassifier
 # ---------------------------------------------------------------------------
 
@@ -152,6 +264,9 @@ class GestureClassifier:
         smooth_alpha_wrist=0.5,
         smooth_alpha_angle=0.3,
         reload_fault_tolerance=3,
+        use_kalman=False,
+        kalman_process_noise=0.01,
+        kalman_measurement_noise=0.005,
     ):
         # ---- 静态手势参数 ----
         self.finger_extend_ratio = finger_extend_ratio
@@ -168,12 +283,14 @@ class GestureClassifier:
         self.reload_cooldown = reload_cooldown
         self.switch_cooldown = switch_cooldown
 
-        # ---- EMA 平滑器 ----
-        self._smooth_openness = EMASmoother(alpha=smooth_alpha_openness)
-        self._smooth_wrist_x = EMASmoother(alpha=smooth_alpha_wrist)
-        self._smooth_wrist_y = EMASmoother(alpha=smooth_alpha_wrist)
-        self._smooth_wrist_z = EMASmoother(alpha=smooth_alpha_wrist)
-        self._smooth_angle = EMASmoother(alpha=smooth_alpha_angle)
+        # ---- 平滑器参数 (保存供运行时切换) ----
+        self.use_kalman = use_kalman
+        self._ema_alphas = (smooth_alpha_openness, smooth_alpha_wrist, smooth_alpha_angle)
+        self._kalman_q = kalman_process_noise
+        self._kalman_r = kalman_measurement_noise
+
+        # ---- 平滑器 (EMA 或 Kalman, 即插即用) ----
+        self._init_smoothers()
 
         # 保存平滑后的最新值 (供 get_feedback 使用)
         self._smoothed_openness = 0.0
@@ -198,6 +315,89 @@ class GestureClassifier:
 
         # ---- 调试 ----
         self.debug_info = {}
+
+    # -------------------------------------------------------------------
+    # 平滑器管理
+    # -------------------------------------------------------------------
+
+    def _init_smoothers(self):
+        """根据 use_kalman 创建对应的平滑器实例"""
+        if self.use_kalman:
+            self._smooth_openness = KalmanSmoother(
+                process_noise=self._kalman_q,
+                measurement_noise=self._kalman_r,
+            )
+            self._smooth_wrist_x = KalmanSmoother(
+                process_noise=self._kalman_q,
+                measurement_noise=self._kalman_r,
+            )
+            self._smooth_wrist_y = KalmanSmoother(
+                process_noise=self._kalman_q,
+                measurement_noise=self._kalman_r,
+            )
+            self._smooth_wrist_z = KalmanSmoother(
+                process_noise=self._kalman_q,
+                measurement_noise=self._kalman_r,
+            )
+            # 角度信号变化慢，用更小的过程噪声
+            self._smooth_angle = KalmanSmoother(
+                process_noise=self._kalman_q * 0.3,
+                measurement_noise=self._kalman_r,
+            )
+        else:
+            alpha_o, alpha_w, alpha_a = self._ema_alphas
+            self._smooth_openness = EMASmoother(alpha=alpha_o)
+            self._smooth_wrist_x = EMASmoother(alpha=alpha_w)
+            self._smooth_wrist_y = EMASmoother(alpha=alpha_w)
+            self._smooth_wrist_z = EMASmoother(alpha=alpha_w)
+            self._smooth_angle = EMASmoother(alpha=alpha_a)
+
+    def toggle_smoother(self):
+        """运行时切换 EMA ↔ Kalman。返回新的模式名称。"""
+        self.use_kalman = not self.use_kalman
+        # 保存当前值，切换后喂给新平滑器作为初始值，减少跳变
+        saved = {
+            "openness": self._smoothed_openness,
+            "wrist": self._smoothed_wrist,
+            "angle": self._smoothed_angle,
+        }
+        self._init_smoothers()
+        # 用保存值初始化新平滑器
+        if saved["openness"] is not None and not isinstance(saved["openness"], float):
+            # 是 EMASmoother/KalmanSmoother 对象，取 .value
+            pass
+        # 直接用 update 喂初始值
+        if hasattr(saved["openness"], 'value') and saved["openness"].value is not None:
+            self._smooth_openness.update(saved["openness"].value)
+        elif isinstance(saved["openness"], (int, float)):
+            self._smooth_openness.update(saved["openness"])
+        wx = saved["wrist"]
+        if isinstance(wx, tuple) and wx != (0.0, 0.0, 0.0):
+            self._smooth_wrist_x.update(wx[0])
+            self._smooth_wrist_y.update(wx[1])
+            self._smooth_wrist_z.update(wx[2])
+        if hasattr(saved["angle"], 'value') and saved["angle"].value is not None:
+            self._smooth_angle.update(saved["angle"].value)
+        elif isinstance(saved["angle"], (int, float)) and saved["angle"] != 0.0:
+            self._smooth_angle.update(saved["angle"])
+
+        return "kalman" if self.use_kalman else "ema"
+
+    def get_smoother_info(self):
+        """返回当前平滑器类型和参数 (供调试显示)"""
+        if self.use_kalman:
+            return {
+                "type": "Kalman",
+                "process_noise": self._kalman_q,
+                "measurement_noise": self._kalman_r,
+            }
+        else:
+            return {
+                "type": "EMA",
+                "alpha_openness": self._ema_alphas[0],
+                "alpha_wrist": self._ema_alphas[1],
+                "alpha_angle": self._ema_alphas[2],
+            }
 
     # -------------------------------------------------------------------
     # 主入口
