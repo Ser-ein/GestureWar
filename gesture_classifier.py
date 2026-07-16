@@ -216,6 +216,74 @@ class KalmanSmoother:
 
 
 # ---------------------------------------------------------------------------
+# PerKeypointKalmanSmoother — 坐标级 Kalman，按运动幅度分组调参
+# ---------------------------------------------------------------------------
+
+class PerKeypointKalmanSmoother:
+    """
+    对 21 个关键点的 (x, y, z) 分别做 Kalman 平滑。
+
+    按运动幅度分 3 组，每组用不同的过程噪声 q:
+      - 高速组 (指尖 TIP ×5): q=0.08 — 保持快速响应，不削峰
+      - 中速组 (DIP/PIP/MCP/手腕 ×15): q=0.05 — 均衡
+      - 低速组 (拇指CMC ×1): q=0.02 — 强平滑去噪
+
+    接口:
+        .smooth(landmarks) → [(x,y,z), ...]  (21个平滑后的坐标元组)
+        .reset()
+    """
+
+    # 关键点分组 (MediaPipe 21点索引)
+    FAST_TIPS = {THUMB_TIP, INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP}   # 4,8,12,16,20
+    SLOW_JOINTS = {THUMB_CMC}                                              # 1 (几乎不动)
+    # 其余 15 个关节 (DIP/PIP/MCP/手腕/拇指IP) 归为中速组
+
+    def __init__(self, fast_q=0.08, medium_q=0.05, slow_q=0.02, r=0.005):
+        self.fast_q = fast_q
+        self.medium_q = medium_q
+        self.slow_q = slow_q
+        self.r = r
+
+        # 21 keypoints × 3 axes = 63 个独立 Kalman 滤波器
+        self._kf = {}
+        for lm_id in range(21):
+            q = self._get_q(lm_id)
+            for axis in ('x', 'y', 'z'):
+                self._kf[(lm_id, axis)] = KalmanSmoother(
+                    process_noise=q, measurement_noise=r
+                )
+
+    def _get_q(self, lm_id):
+        if lm_id in self.FAST_TIPS:
+            return self.fast_q
+        elif lm_id in self.SLOW_JOINTS:
+            return self.slow_q
+        else:
+            return self.medium_q
+
+    def smooth(self, landmarks):
+        """
+        输入: 21 个 landmark 对象 (有 .x .y .z 属性) 或 (x,y,z) 元组列表
+        返回: 21 个 (x, y, z) 平滑后的元组
+        """
+        result = []
+        for i, lm in enumerate(landmarks):
+            if hasattr(lm, 'x'):
+                x, y, z = lm.x, lm.y, lm.z
+            else:
+                x, y, z = lm
+            sx = self._kf[(i, 'x')].update(x)
+            sy = self._kf[(i, 'y')].update(y)
+            sz = self._kf[(i, 'z')].update(z)
+            result.append((sx, sy, sz))
+        return result
+
+    def reset(self):
+        for kf in self._kf.values():
+            kf.reset()
+
+
+# ---------------------------------------------------------------------------
 # GestureClassifier
 # ---------------------------------------------------------------------------
 
@@ -265,8 +333,9 @@ class GestureClassifier:
         smooth_alpha_angle=0.3,
         reload_fault_tolerance=3,
         use_kalman=False,
-        kalman_process_noise=0.01,
+        kalman_process_noise=0.05,       # 过程噪声 (合成测试调优: 0.01→0.05)
         kalman_measurement_noise=0.005,
+        use_per_keypoint_kalman=False,   # 坐标级 Kalman: 先平滑 21 点再提取特征
     ):
         # ---- 静态手势参数 ----
         self.finger_extend_ratio = finger_extend_ratio
@@ -291,6 +360,10 @@ class GestureClassifier:
 
         # ---- 平滑器 (EMA 或 Kalman, 即插即用) ----
         self._init_smoothers()
+
+        # ---- 坐标级 Kalman (可选, 在特征提取前平滑关键点) ----
+        self._use_pk_kalman = use_per_keypoint_kalman
+        self._pk_smoother = PerKeypointKalmanSmoother() if use_per_keypoint_kalman else None
 
         # 保存平滑后的最新值 (供 get_feedback 使用)
         self._smoothed_openness = 0.0
@@ -353,20 +426,14 @@ class GestureClassifier:
             self._smooth_angle = EMASmoother(alpha=alpha_a)
 
     def toggle_smoother(self):
-        """运行时切换 EMA ↔ Kalman。返回新的模式名称。"""
+        """运行时切换 EMA ↔ Kalman (特征级)。返回新的模式名称。"""
         self.use_kalman = not self.use_kalman
-        # 保存当前值，切换后喂给新平滑器作为初始值，减少跳变
         saved = {
             "openness": self._smoothed_openness,
             "wrist": self._smoothed_wrist,
             "angle": self._smoothed_angle,
         }
         self._init_smoothers()
-        # 用保存值初始化新平滑器
-        if saved["openness"] is not None and not isinstance(saved["openness"], float):
-            # 是 EMASmoother/KalmanSmoother 对象，取 .value
-            pass
-        # 直接用 update 喂初始值
         if hasattr(saved["openness"], 'value') and saved["openness"].value is not None:
             self._smooth_openness.update(saved["openness"].value)
         elif isinstance(saved["openness"], (int, float)):
@@ -383,8 +450,25 @@ class GestureClassifier:
 
         return "kalman" if self.use_kalman else "ema"
 
+    def toggle_per_keypoint_kalman(self):
+        """运行时切换坐标级 Kalman 模式。返回新的模式名称。"""
+        self._use_pk_kalman = not self._use_pk_kalman
+        if self._use_pk_kalman:
+            self._pk_smoother = PerKeypointKalmanSmoother()
+        else:
+            self._pk_smoother = None
+        return "per_keypoint_kalman" if self._use_pk_kalman else "feature_level"
+
     def get_smoother_info(self):
         """返回当前平滑器类型和参数 (供调试显示)"""
+        if self._use_pk_kalman:
+            return {
+                "type": "PerKeypointKalman",
+                "fast_q": 0.08,
+                "medium_q": 0.05,
+                "slow_q": 0.02,
+                "r": 0.005,
+            }
         if self.use_kalman:
             return {
                 "type": "Kalman",
@@ -423,6 +507,10 @@ class GestureClassifier:
 
         # 提取 (x, y, z) 元组
         pts = [(lm.x, lm.y, lm.z) for lm in hand_landmarks]
+
+        # ---- 坐标级 Kalman (可选): 在特征提取前平滑所有关键点 ----
+        if self._use_pk_kalman and self._pk_smoother is not None:
+            pts = self._pk_smoother.smooth(hand_landmarks)
 
         # 更新历史 (必须先更新，时序检测依赖历史数据)
         self._update_history(pts, timestamp)
@@ -670,23 +758,31 @@ class GestureClassifier:
     # -------------------------------------------------------------------
 
     def _update_history(self, pts, timestamp):
-        """维护时序历史数据 — 先 EMA 平滑再存，滤除摄像头抖动"""
-        # 张开度 → 平滑
+        """维护时序历史数据 — 先平滑再存，滤除摄像头抖动"""
+        # 展开度
         raw_openness = self._compute_openness(pts)
-        self._smoothed_openness = self._smooth_openness.update(raw_openness)
-        self._openness_history.append((timestamp, self._smoothed_openness))
-
-        # 手腕位置 → 逐轴平滑
+        # 手腕位置
         wrist = pts[WRIST]
-        sx = self._smooth_wrist_x.update(wrist[0])
-        sy = self._smooth_wrist_y.update(wrist[1])
-        sz = self._smooth_wrist_z.update(wrist[2])
-        self._smoothed_wrist = (sx, sy, sz)
-        self._wrist_history.append((timestamp, sx, sy, sz))
-
-        # 手掌角度 → 平滑
+        # 手掌角度
         raw_angle = self._compute_palm_angle(pts)
-        self._smoothed_angle = self._smooth_angle.update(raw_angle)
+
+        if self._use_pk_kalman:
+            # 坐标级 Kalman 模式: 关键点已在 classify() 中平滑,
+            # 派生特征天然稳定, 跳过特征级平滑器
+            self._smoothed_openness = raw_openness
+            self._smoothed_wrist = wrist  # (x, y, z) 元组
+            self._smoothed_angle = raw_angle
+        else:
+            # 特征级平滑 (EMA 或 Kalman)
+            self._smoothed_openness = self._smooth_openness.update(raw_openness)
+            sx = self._smooth_wrist_x.update(wrist[0])
+            sy = self._smooth_wrist_y.update(wrist[1])
+            sz = self._smooth_wrist_z.update(wrist[2])
+            self._smoothed_wrist = (sx, sy, sz)
+            self._smoothed_angle = self._smooth_angle.update(raw_angle)
+
+        self._openness_history.append((timestamp, self._smoothed_openness))
+        self._wrist_history.append((timestamp, *self._smoothed_wrist))
         self._palm_angle_history.append((timestamp, self._smoothed_angle))
 
         # 清理过期数据
@@ -956,6 +1052,8 @@ class GestureClassifier:
         self._smooth_wrist_y.reset()
         self._smooth_wrist_z.reset()
         self._smooth_angle.reset()
+        if self._pk_smoother is not None:
+            self._pk_smoother.reset()
         self._smoothed_openness = 0.0
         self._smoothed_wrist = (0.0, 0.0, 0.0)
         self._smoothed_angle = 0.0

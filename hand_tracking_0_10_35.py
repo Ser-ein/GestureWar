@@ -25,7 +25,7 @@ from mediapipe.tasks.python.vision import (
 from mediapipe import Image, ImageFormat
 
 # 手势分类器
-from gesture_classifier import GestureClassifier
+from gesture_classifier import GestureClassifier, PerKeypointKalmanSmoother
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ class HandTracker:
     """手部追踪器类 - 适配 MediaPipe 0.10.35+ Tasks API"""
 
     def __init__(self, max_hands=2, detection_confidence=0.7, tracking_confidence=0.5,
-                 enable_gesture=True, use_kalman=False):
+                 enable_gesture=True, use_kalman=False, use_per_keypoint_kalman=False):
         """
         初始化手部追踪器
 
@@ -94,6 +94,7 @@ class HandTracker:
             tracking_confidence: 追踪置信度阈值
             enable_gesture: 是否启用手势分类
             use_kalman: 是否使用 Kalman 滤波 (默认 EMA)
+            use_per_keypoint_kalman: 是否使用坐标级 Kalman (默认 False)
         """
         print("正在初始化手部追踪器 (MediaPipe 0.10.35+ Tasks API)...")
 
@@ -138,11 +139,16 @@ class HandTracker:
         # 手势分类器
         self.enable_gesture = enable_gesture
         self.use_kalman = use_kalman
-        self.gesture_classifier = GestureClassifier(use_kalman=use_kalman) if enable_gesture else None
+        self.use_per_keypoint_kalman = use_per_keypoint_kalman
+        self.gesture_classifier = GestureClassifier(
+            use_kalman=use_kalman,
+            use_per_keypoint_kalman=use_per_keypoint_kalman,
+        ) if enable_gesture else None
 
         # 性能统计
         self.fps = 0
         self.frame_count = 0
+        self.frame_id = 0          # 全局递增帧序号 (用于 UDP 丢包检测)
         self.start_time = time.time()
 
         print("手部追踪器初始化完成！")
@@ -171,7 +177,10 @@ class HandTracker:
         result = self.landmarker.detect(mp_image)
 
         # 初始化手部数据 (格式与旧版保持兼容)
+        self.frame_id += 1
         hand_data = {
+            "timestamp": time.time(),    # Unix 秒, 毫秒精度 — 用于延迟测量
+            "frame_id": self.frame_id,   # 递增序号 — 用于丢包检测
             "num_hands": 0,
             "hands": []
         }
@@ -374,7 +383,10 @@ class HandTracker:
         # ---- 平滑器类型 ----
         line4_y = line3_y + 16
         smoother_info = clf.get_smoother_info()
-        if smoother_info["type"] == "Kalman":
+        if smoother_info["type"] == "PerKeypointKalman":
+            s_text = "Smoother: PK-KF (21pt grouped q)"
+            s_color = (100, 200, 255)  # 淡蓝 = 坐标级 Kalman
+        elif smoother_info["type"] == "Kalman":
             s_text = f"Smoother: KF (q={clf._kalman_q}, r={clf._kalman_r})"
             s_color = (255, 200, 100)  # 金色 = Kalman
         else:
@@ -467,7 +479,8 @@ def main():
     print("  [s] 保存当前帧为图片")
     print("  [i] 显示详细信息")
     print("  [u] 切换 UDP 发送 (开/关)")
-    print("  [k] 切换 Kalman/EMA 平滑器")
+    print("  [k] 三模式循环: EMA → Kalman(特征) → PK-KF(坐标级)")
+    print("  [p] 直接切换坐标级 Kalman 开/关")
     print("=" * 60)
 
     # 初始化手部追踪器
@@ -572,11 +585,39 @@ def main():
                 status = "启用" if udp_enabled else "禁用"
                 print(f"UDP 发送已{status}")
             elif key == ord('k'):
-                # 切换 Kalman / EMA 平滑器
+                # 三模式循环: EMA → Kalman(特征) → PerKeypointKalman → EMA → ...
                 if tracker.gesture_classifier:
-                    new_mode = tracker.gesture_classifier.toggle_smoother()
-                    tracker.use_kalman = tracker.gesture_classifier.use_kalman
-                    print(f"平滑器已切换为: {new_mode.upper()}")
+                    clf = tracker.gesture_classifier
+                    if clf._use_pk_kalman:
+                        # 当前是坐标级 Kalman → 切回 EMA (特征级)
+                        clf._use_pk_kalman = False
+                        clf._pk_smoother = None
+                        clf.use_kalman = False
+                        clf._init_smoothers()
+                        tracker.use_per_keypoint_kalman = False
+                        tracker.use_kalman = False
+                        print("平滑器: EMA (特征级)")
+                    elif clf.use_kalman:
+                        # 当前是特征级 Kalman → 切到坐标级 Kalman
+                        clf._use_pk_kalman = True
+                        clf._pk_smoother = PerKeypointKalmanSmoother()
+                        tracker.use_per_keypoint_kalman = True
+                        print("平滑器: PerKeypointKalman (坐标级, 21点分组)")
+                    else:
+                        # 当前是 EMA → 切到特征级 Kalman
+                        clf.use_kalman = True
+                        clf._init_smoothers()
+                        tracker.use_kalman = True
+                        print("平滑器: Kalman (特征级)")
+                    info = clf.get_smoother_info()
+                    print(f"  参数: {info}")
+            elif key == ord('p'):
+                # 直接切换坐标级 Kalman 开/关 (快捷方式)
+                if tracker.gesture_classifier:
+                    new_mode = tracker.gesture_classifier.toggle_per_keypoint_kalman()
+                    tracker.use_per_keypoint_kalman = tracker.gesture_classifier._use_pk_kalman
+                    label = "坐标级 Kalman (21点分组)" if tracker.use_per_keypoint_kalman else "特征级平滑"
+                    print(f"平滑模式已切换为: {label}")
                     info = tracker.gesture_classifier.get_smoother_info()
                     print(f"  参数: {info}")
 

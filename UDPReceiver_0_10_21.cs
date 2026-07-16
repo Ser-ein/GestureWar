@@ -60,16 +60,20 @@ public class UDPReceiver_0_10_21 : MonoBehaviour
     [System.Serializable]
     public class HandData
     {
+        public float timestamp;       // Unix 秒 — Python 端发送时间
+        public int frame_id;          // 递增帧序号 — 用于丢包检测
         public int num_hands;
         public List<HandInfo> hands;
     }
-    
+
     [System.Serializable]
     public class HandInfo
     {
         public int id;
         public List<Landmark> landmarks;
         public BoundingBox bounding_box;
+        public string gesture;           // 手势名称 (shoot/aim/grenade/reload/melee/switch_weapon/none)
+        public float gesture_confidence; // 手势置信度 (0~1)
     }
     
     [System.Serializable]
@@ -177,7 +181,16 @@ public class UDPReceiver_0_10_21 : MonoBehaviour
             float timeSinceLastData = Time.time - lastDataTime;
             string timeoutStatus = timeSinceLastData > 1f ? " (超时)" : "";
             
-            Debug.Log($"接收帧率: {fps:F1} FPS, 手部数量: {currentHandData.num_hands}{timeoutStatus}");
+            string gestureInfo = "";
+            if (currentHandData.hands.Count > 0)
+            {
+                var h = currentHandData.hands[0];
+                gestureInfo = $", 手势: {h.gesture}({h.gesture_confidence:P0})";
+            }
+            int lost = GetPacketLossCount();
+            string lossInfo = lost > 0 ? $", 丢包: {lost}" : "";
+            Debug.Log($"接收帧率: {fps:F1} FPS, 手部数量: {currentHandData.num_hands}"
+                      + $"{gestureInfo}{lossInfo}{timeoutStatus}");
             
             // 重置统计
             framesReceived = 0;
@@ -311,6 +324,59 @@ public class UDPReceiver_0_10_21 : MonoBehaviour
         lock (currentHandData)
         {
             return currentHandData;
+        }
+    }
+
+    // 公开方法：获取当前识别的手势 (取第一只手)
+    public string GetCurrentGesture()
+    {
+        lock (currentHandData)
+        {
+            if (currentHandData.hands.Count > 0)
+                return currentHandData.hands[0].gesture ?? "none";
+            return "none";
+        }
+    }
+
+    // 公开方法：获取当前手势及其置信度
+    public (string gesture, float confidence) GetCurrentGestureWithConfidence()
+    {
+        lock (currentHandData)
+        {
+            if (currentHandData.hands.Count > 0)
+            {
+                var hand = currentHandData.hands[0];
+                return (hand.gesture ?? "none", hand.gesture_confidence);
+            }
+            return ("none", 0f);
+        }
+    }
+
+    // 公开方法：获取数据延迟 (秒) — 需 Unity 端也有时间基准
+    public float GetDataLatency()
+    {
+        lock (currentHandData)
+        {
+            if (currentHandData.timestamp > 0)
+                return Time.time - currentHandData.timestamp;
+            return -1f;
+        }
+    }
+
+    // 公开方法：检测丢包 (需要记录上一次的 frame_id)
+    private int lastFrameId = -1;
+    public int GetPacketLossCount()
+    {
+        lock (currentHandData)
+        {
+            if (lastFrameId < 0)
+            {
+                lastFrameId = currentHandData.frame_id;
+                return 0;
+            }
+            int gap = currentHandData.frame_id - lastFrameId - 1;
+            lastFrameId = currentHandData.frame_id;
+            return gap > 0 ? gap : 0;
         }
     }
     
